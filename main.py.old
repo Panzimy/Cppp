@@ -1,0 +1,1301 @@
+import re
+import sys
+import random
+import subprocess
+import shutil
+import os
+import json
+import textwrap
+from pathlib import Path
+import ctypes
+import tempfile
+
+
+class CpppError(Exception):
+    """Chyba interpretu C+++."""
+
+class Cppp:
+    def __init__(self, system_memory_enabled=False):
+        self.variables = {}
+        self.variable_types = {}
+        self.classes = {}
+        self.call_depth = 0
+        self.enums = {}
+
+        # Python memory
+        self.memory = {}
+        self.next_memory_address = 1
+
+        # Native memory
+        self.system_memory_enabled = system_memory_enabled
+        self.system_memory = None
+        self.system_memory_directory = None
+        self.system_allocations = set()
+
+        if system_memory_enabled:
+            self.load_system_memory()
+
+
+    # --------------------------------------------------
+    # BUILT-IN LANGS: C, C+, C++, JAVA
+    # --------------------------------------------------
+
+    def run_compiled_language(self, language, body, bindings):
+        import tempfile
+
+        project_dir = Path(__file__).resolve().parent
+
+        mingw_bin = project_dir / "mingw64" / "bin"
+        java_bin = project_dir / "java" / "bin"
+
+        compilers = {
+            "c": (mingw_bin / "gcc.exe", ".c"),
+            "cplus": (mingw_bin / "g++.exe", ".cpp"),
+            "cpp": (mingw_bin / "g++.exe", ".cpp"),
+            "java": (java_bin / "javac.exe", ".java"),
+        }
+
+        if language not in compilers:
+            raise CpppError(f"Unsupported language: {language}")
+
+        compiler, extension = compilers[language]
+
+        if not compiler.is_file():
+            raise CpppError(f"Compiler not found: {compiler}")
+
+        source = textwrap.dedent("\n".join(body))
+
+        environment = os.environ.copy()
+
+        # Lokální runtime knihovny MinGW a Java
+        extra_paths = []
+
+        if mingw_bin.is_dir():
+            extra_paths.append(str(mingw_bin))
+
+        if java_bin.is_dir():
+            extra_paths.append(str(java_bin))
+
+        environment["PATH"] = (
+                os.pathsep.join(extra_paths)
+                + os.pathsep
+                + environment.get("PATH", "")
+        )
+
+        with tempfile.TemporaryDirectory(prefix="cppp_") as temp:
+            directory = Path(temp)
+            source_file = directory / f"Main{extension}"
+
+            source_file.write_text(source, encoding="utf-8")
+
+            if language == "java":
+                java_executable = java_bin / "java.exe"
+
+                if not java_executable.is_file():
+                    raise CpppError(
+                        f"Java runtime not found: {java_executable}"
+                    )
+
+                compile_command = [
+                    str(compiler),
+                    "-encoding", "UTF-8",
+                    str(source_file),
+                ]
+
+                run_command = [
+                    str(java_executable),
+                    "-cp", str(directory),
+                    "Main",
+                ]
+
+            else:
+                output_file = directory / "program.exe"
+
+                compile_command = [
+                    str(compiler),
+                    "-O2",
+                    str(source_file),
+                    "-o",
+                    str(output_file),
+                ]
+
+                run_command = [str(output_file)]
+
+            try:
+                compilation = subprocess.run(
+                    compile_command,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=60,
+                    cwd=directory,
+                    env=environment,
+                )
+
+                if compilation.returncode != 0:
+                    raise CpppError(
+                        "Compilation failed:\n"
+                        + compilation.stdout
+                        + compilation.stderr
+                    )
+
+                execution = subprocess.run(
+                    run_command,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=15,
+                    cwd=directory,
+                    env=environment,
+                )
+
+                if execution.returncode != 0:
+                    raise CpppError(
+                        "Program failed:\n"
+                        f"Exit code: {execution.returncode}\n"
+                        f"STDOUT:\n{execution.stdout}\n"
+                        f"STDERR:\n{execution.stderr}"
+                    )
+
+                output = execution.stdout
+
+            except subprocess.TimeoutExpired as error:
+                raise CpppError(
+                    f"{language} execution timed out"
+                ) from error
+
+        for name, mode in bindings.items():
+            if mode == "val":
+                self.set_variable(
+                    name,
+                    output.rstrip("\r\n"),
+                    "val",
+                )
+            elif mode == "null":
+                self.set_variable(name, None, "null")
+            else:
+                raise CpppError(
+                    "Compiled-language output currently supports "
+                    "val and null bindings only"
+                )
+
+    # --------------------------------------------------
+    # MEMORY SYSTEM
+    # --------------------------------------------------
+
+
+    # --------------------------------------------------
+    # NATIVE SYSTEM MEMORY DLL
+    # --------------------------------------------------
+
+    def load_system_memory(self):
+        if os.name != "nt":
+            raise CpppError("System memory DLL requires Windows")
+
+        dll_path = (
+            Path(__file__).resolve().parent
+            / "native"
+            / "system_memory.dll"
+        )
+
+        mingw_bin = (
+            Path(__file__).resolve().parent
+            / "mingw64"
+            / "bin"
+        )
+
+        if not dll_path.is_file():
+            raise CpppError(
+                f"System memory DLL not found: {dll_path}"
+            )
+
+        if not mingw_bin.is_dir():
+            raise CpppError(
+                f"MinGW runtime directory not found: {mingw_bin}"
+            )
+
+        try:
+            self.system_memory_directory = (
+                os.add_dll_directory(str(mingw_bin))
+            )
+
+            dll = ctypes.CDLL(str(dll_path))
+
+            dll.sm_alloc.argtypes = [ctypes.c_uint64]
+            dll.sm_alloc.restype = ctypes.c_uint64
+
+            dll.sm_write.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_uint8,
+            ]
+            dll.sm_write.restype = ctypes.c_int
+
+            dll.sm_read.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.POINTER(ctypes.c_uint8),
+            ]
+            dll.sm_read.restype = ctypes.c_int
+
+            dll.sm_free.argtypes = [ctypes.c_uint64]
+            dll.sm_free.restype = ctypes.c_int
+
+            dll.sm_size.argtypes = [
+                ctypes.c_uint64,
+                ctypes.POINTER(ctypes.c_uint64),
+            ]
+            dll.sm_size.restype = ctypes.c_int
+
+            self.system_memory = dll
+
+        except (OSError, AttributeError) as error:
+            raise CpppError(
+                f"Cannot load system memory DLL: {error}"
+            ) from error
+
+    def system_memory_require(self):
+        if not self.system_memory_enabled:
+            raise CpppError(
+                "System memory disabled. "
+                "Use --i-know-what-im-doin"
+            )
+
+        if self.system_memory is None:
+            raise CpppError("System memory DLL is not loaded")
+
+    def system_memory_alloc(self, size):
+        self.system_memory_require()
+
+        if type(size) is not int or not 1 <= size <= 100_000_000:
+            raise CpppError("Invalid system memory size")
+
+        address = self.system_memory.sm_alloc(size)
+
+        if not address:
+            raise CpppError("VirtualAlloc failed")
+
+        self.system_allocations.add(address)
+
+        return address
+
+    def system_memory_check(self, address, offset, length=1):
+        self.system_memory_require()
+
+        if type(address) is not int or address not in self.system_allocations:
+            raise CpppError("Invalid system memory allocation")
+
+        if type(offset) is not int or type(length) is not int:
+            raise CpppError("Invalid memory range")
+
+        if offset < 0 or length < 0:
+            raise CpppError("Invalid memory range")
+
+        size = ctypes.c_uint64()
+
+        if not self.system_memory.sm_size(
+            address,
+            ctypes.byref(size),
+        ):
+            raise CpppError("Cannot determine allocation size")
+
+        if offset + length > size.value:
+            raise CpppError("System memory range out of bounds")
+
+    def system_memory_write(self, address, value, offset=0):
+        self.system_memory_check(address, offset)
+
+        if type(value) is not int or not 0 <= value <= 255:
+            raise CpppError("Memory value must be 0-255")
+
+        if not self.system_memory.sm_write(
+            address,
+            offset,
+            value,
+        ):
+            raise CpppError("Native memory write failed")
+
+    def system_memory_read(self, address, offset=0):
+        self.system_memory_check(address, offset)
+
+        result = ctypes.c_uint8()
+
+        if not self.system_memory.sm_read(
+            address,
+            offset,
+            ctypes.byref(result),
+        ):
+            raise CpppError("Native memory read failed")
+
+        return result.value
+
+    def system_memory_free(self, address):
+        self.system_memory_require()
+
+        if type(address) is not int or address not in self.system_allocations:
+            raise CpppError("Invalid system memory allocation")
+
+        if not self.system_memory.sm_free(address):
+            raise CpppError("VirtualFree failed")
+
+        self.system_allocations.remove(address)
+
+    def close_system_memory(self):
+        if self.system_memory is not None:
+            for address in list(self.system_allocations):
+                try:
+                    self.system_memory_free(address)
+                except CpppError as error:
+                    print(
+                        f"Warning: memory cleanup failed: {error}",
+                        file=sys.stderr,
+                    )
+
+        self.system_allocations.clear()
+
+        self.system_memory = None
+
+        if self.system_memory_directory is not None:
+            self.system_memory_directory.close()
+            self.system_memory_directory = None
+
+    # --------------------------------------------------
+    # NON-SYSTEM MEMORY
+    # --------------------------------------------------
+
+
+    def memory_alloc(self, size):
+        if not 1 <= size <= 100_000_000:
+            raise CpppError("Invalid memory size")
+
+        address = self.next_memory_address
+        self.next_memory_address += 1
+
+        self.memory[address] = bytearray(size)
+
+        return address
+
+    def memory_check(self, address, offset, length):
+        if type(address) is not int or address not in self.memory:
+            raise CpppError("Invalid memory address")
+
+        if type(offset) is not int or type(length) is not int:
+            raise CpppError("Invalid memory range")
+
+        block = self.memory[address]
+
+        if offset < 0 or length < 0 or offset + length > len(block):
+            raise CpppError("Memory range out of bounds")
+
+        return block
+
+    def memory_write_string(self, address, value, offset=0):
+        if not isinstance(value, str):
+            raise CpppError("Expected string")
+
+        data = value.encode("utf-8")
+        block = self.memory_check(address, offset, len(data))
+        block[offset:offset + len(data)] = data
+
+    def memory_read_string(self, address, length, offset=0):
+        block = self.memory_check(address, offset, length)
+
+        try:
+            return bytes(block[offset:offset + length]).decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise CpppError("Invalid UTF-8 in memory") from error
+
+    def memory_write_int32(self, address, value, offset=0):
+        if type(value) is not int or not -(2 ** 31) <= value < 2 ** 31:
+            raise CpppError("Value must be a signed int32")
+
+        block = self.memory_check(address, offset, 4)
+        block[offset:offset + 4] = value.to_bytes(
+            4, byteorder="little", signed=True
+        )
+
+    def memory_read_int32(self, address, offset=0):
+        block = self.memory_check(address, offset, 4)
+
+        return int.from_bytes(
+            block[offset:offset + 4],
+            byteorder="little",
+            signed=True
+        )
+
+    def memory_dump(self, address, offset=0, length=16):
+        block = self.memory_check(address, offset, length)
+
+        if length > 256:
+            raise CpppError("Memory dump limited to 256 bytes")
+
+        data = block[offset:offset + length]
+
+        print(" ".join(f"{byte:02X}" for byte in data))
+
+    def memory_read(self, address, offset=0):
+        if address not in self.memory:
+            raise CpppError("Invalid memory address")
+
+        block = self.memory[address]
+
+        if not 0 <= offset < len(block):
+            raise CpppError("Memory offset out of range")
+
+        return block[offset]
+
+    def memory_write(self, address, value, offset=0):
+        if address not in self.memory:
+            raise CpppError("Invalid memory address")
+
+        if type(value) is not int or not 0 <= value <= 255:
+            raise CpppError("Memory value must be 0-255")
+
+        block = self.memory[address]
+
+        if not 0 <= offset < len(block):
+            raise CpppError("Memory offset out of range")
+
+        block[offset] = value
+
+    def memory_free(self, address):
+        if address not in self.memory:
+            raise CpppError("Invalid memory address")
+
+        del self.memory[address]
+
+    # --------------------------------------------------
+    # LIBS and IMPORTS
+    # --------------------------------------------------
+
+    def get_library_dirs(self, source_path):
+        local_app_data = Path(
+            os.environ.get(
+                "LOCALAPPDATA",
+                str(Path.home() / "AppData" / "Local"),
+            )
+        )
+
+        system_lib = (
+            local_app_data / "Programs" / "CPPP" / "lib"
+        )
+        project_lib = Path(source_path).resolve().parent / "lib"
+
+        return [system_lib, project_lib]
+
+    def load_libraries(self, source_path):
+        for library_dir in self.get_library_dirs(source_path):
+            if not library_dir.is_dir():
+                continue
+
+            for library_path in sorted(library_dir.glob("*.cppp")):
+                try:
+                    source = library_path.read_text(encoding="utf-8")
+                    self.run_lines(self.remove_comments(source))
+                except (OSError, CpppError) as error:
+                    raise CpppError(
+                        f"Library error in {library_path}: {error}"
+                    ) from error
+
+    # --------------------------------------------------
+    # COMMENTS
+    # # ONE-LINE COMMENT
+    # ## MORE-LINE COMMENT ##
+    # --------------------------------------------------
+
+    def remove_comments(self, source):
+        result = []
+        in_comment = False
+
+        preprocessor_directives = (
+            "include",
+            "define",
+            "undef",
+            "if",
+            "ifdef",
+            "ifndef",
+            "elif",
+            "else",
+            "endif",
+            "pragma",
+            "error",
+            "line",
+        )
+
+        for line in source.splitlines():
+            stripped = line.lstrip()
+
+            # Zachování C/C++ preprocesorových direktiv.
+            if not in_comment and stripped.startswith("#"):
+                directive = stripped[1:].lstrip().split(
+                    None, 1
+                )
+
+                if directive and directive[0] in preprocessor_directives:
+                    result.append(line)
+                    continue
+
+            output = []
+            i = 0
+            in_string = False
+            escaped = False
+
+            while i < len(line):
+                if in_comment:
+                    end = line.find("##", i)
+
+                    if end == -1:
+                        break
+
+                    in_comment = False
+                    i = end + 2
+                    continue
+
+                if line.startswith("##", i) and not in_string:
+                    in_comment = True
+                    i += 2
+                    continue
+
+                char = line[i]
+
+                if in_string:
+                    output.append(char)
+
+                    if escaped:
+                        escaped = False
+                    elif char == "\\":
+                        escaped = True
+                    elif char == '"':
+                        in_string = False
+
+                    i += 1
+                    continue
+
+                if char == "#":
+                    break
+
+                if char == '"':
+                    in_string = True
+
+                output.append(char)
+                i += 1
+
+            if not in_comment:
+                result.append("".join(output))
+
+        if in_comment:
+            raise CpppError("Missing closing ## for comment")
+
+        return result
+
+    # --------------------------------------------------
+    # VALs
+    # --------------------------------------------------
+
+    def get_value(self, expression):
+        expression = expression.strip()
+
+        if not expression:
+            raise CpppError("Missing value")
+
+        match = re.fullmatch(
+            r"\{([A-Za-z_]\w*)\}",
+            expression,
+        )
+
+        if match:
+            name = match.group(1)
+
+            if name not in self.variables:
+                raise CpppError(
+                    f"Unknown variable: {name}"
+                )
+
+            return self.variables[name]
+
+        if expression.startswith('"') and expression.endswith('"'):
+            try:
+                return json.loads(expression)
+            except ValueError as error:
+                raise CpppError(
+                    f"Invalid string: {expression}"
+                ) from error
+
+        if expression == "null":
+            return None
+        if expression == "true":
+            return True
+        if expression == "false":
+            return False
+
+        if re.fullmatch(r"-?\d+", expression):
+            return int(expression)
+
+        if re.fullmatch(r"-?\d+\.\d+", expression):
+            return float(expression)
+
+        if expression in self.variables:
+            return self.variables[expression]
+
+        if expression in self.enums:
+            return self.enums[expression]
+
+        return None
+
+    def set_variable(self, name, value, mode=None):
+        if mode == "null":
+            value = None
+        elif mode == "num" and type(value) not in (int, float):
+            raise CpppError(
+                f"Variable {name!r} must contain a number"
+            )
+
+        self.variables[name] = value
+        self.variable_types[name] = mode
+
+    # --------------------------------------------------
+    # BUILT IN PYTHON
+    #
+    # /python f as val, n as num, d as null/(
+    #     f = input("Text: ")
+    #     n = n + 1
+    #     d = 123
+    # )
+    # --------------------------------------------------
+
+    def run_python(self, body, bindings):
+        namespace = {
+            "__builtins__": __builtins__,
+        }
+
+        for name, mode in bindings.items():
+            value = self.variables.get(name)
+
+            if mode == "null":
+                namespace[name] = None
+            elif mode == "num":
+                namespace[name] = (
+                    value if type(value) in (int, float) else 0
+                )
+            else:
+                namespace[name] = value
+
+        code = textwrap.dedent("\n".join(body))
+
+        try:
+            exec(code, namespace, namespace)
+        except Exception as error:
+            raise CpppError(
+                f"Embedded Python error: {error}"
+            ) from error
+
+        for name, mode in bindings.items():
+            value = namespace.get(name)
+
+            if mode == "null":
+                self.set_variable(name, None, "null")
+            elif mode == "num":
+                self.set_variable(name, value, "num")
+            else:
+                self.set_variable(name, value, "val")
+
+    # --------------------------------------------------
+    # RANDOM
+    # /random [val a] [enum alph] 16/
+    # --------------------------------------------------
+
+    def random_value(self, name, enum_name, length):
+        if enum_name not in self.enums:
+            raise CpppError(f"Unknown enum: {enum_name}")
+
+        if not 0 <= length <= 1_000_000:
+            raise CpppError(
+                "Random length must be between 0 and 1000000"
+            )
+
+        chars = self.enums[enum_name]
+        if not chars:
+            raise CpppError(f"Enum {enum_name!r} is empty")
+
+        self.set_variable(
+            name,
+            "".join(random.choice(chars) for _ in range(length)),
+            "val",
+        )
+
+    # --------------------------------------------------
+    # ENUMs
+    # --------------------------------------------------
+
+    def parse_enum(self, name, body):
+        values = []
+
+        for raw_line in body:
+            line = raw_line.strip().rstrip(",")
+            if not line:
+                continue
+
+            if line.startswith("/") and line.endswith("/"):
+                line = line[1:-1].strip()
+
+            if line.startswith("value "):
+                line = line[6:].strip()
+
+            value = self.get_value(line)
+
+            if isinstance(value, str):
+                values.extend(value)
+            elif value is not None:
+                values.append(str(value))
+
+        if not values:
+            raise CpppError(
+                f"Enum {name!r} must contain values"
+            )
+
+        self.enums[name] = "".join(values)
+
+    # --------------------------------------------------
+    # EXTERNAL PROGRAMS
+    # --------------------------------------------------
+
+    def run_program(self, expression):
+        program = self.get_value(expression)
+
+        if not isinstance(program, str) or not program:
+            raise CpppError(
+                "run expects a non-empty program name"
+            )
+
+        executable = shutil.which(program)
+        if executable is None:
+            raise CpppError(f"Program not found: {program}")
+
+        try:
+            subprocess.Popen([executable])
+        except OSError as error:
+            raise CpppError(
+                f"Cannot start {program}: {error}"
+            ) from error
+
+    # --------------------------------------------------
+    # BLOCKS and EXECUTION
+    # --------------------------------------------------
+
+    def read_block(self, lines, start, opening, closing):
+        depth = 1
+        body = []
+        i = start
+
+        while i < len(lines):
+            line = lines[i].strip()
+
+            if line == opening:
+                depth += 1
+            elif line == closing:
+                depth -= 1
+                if depth == 0:
+                    return body, i + 1
+
+            body.append(lines[i])
+            i += 1
+
+        raise CpppError(f"Missing closing {closing!r}")
+
+    def run_lines(self, lines):
+        i = 0
+
+        while i < len(lines):
+            line = lines[i].strip()
+            i += 1
+
+            if not line:
+                continue
+
+            # IMPORT KNIHOVNY
+            # /import enums/
+            match = re.fullmatch(r"/import\s+([A-Za-z_]\w*)/", line)
+
+            if match:
+                library_name = match.group(1)
+                source_path = getattr(self, "source_path", None)
+
+                if source_path is None:
+                    raise CpppError(
+                        "Cannot import library without source path"
+                    )
+
+                found = False
+
+                for library_dir in self.get_library_dirs(source_path):
+                    candidates = [
+                        library_dir / f"{library_name}.cppp",
+                        library_dir / f"{library_name}.cppp".replace(
+                            ".cppp", ".cppp"
+                        ),
+                    ]
+
+                    for library_path in candidates:
+                        if not library_path.is_file():
+                            continue
+
+                        source = library_path.read_text(encoding="utf-8")
+                        self.run_lines(self.remove_comments(source))
+                        found = True
+                        break
+
+                    if found:
+                        break
+
+                if not found:
+                    raise CpppError(
+                        f"Library not found: {library_name}"
+                    )
+
+                continue
+
+            # PYTHON
+            # /python {f as val, n as num, d as null}/(
+            match = re.fullmatch(r"/python\s+\{(.+?)\}/\(", line)
+
+            if match:
+                bindings = {}
+
+                for item in match.group(1).split(","):
+                    binding = re.fullmatch(
+                        r"\s*([A-Za-z_]\w*)\s+as\s+(val|null|num)\s*",
+                        item,
+                    )
+
+                    if not binding:
+                        raise CpppError(
+                            f"Invalid Python binding: {item.strip()}"
+                        )
+
+                    name, mode = binding.groups()
+
+                    if name in bindings:
+                        raise CpppError(
+                            f"Duplicate Python binding: {name}"
+                        )
+
+                    bindings[name] = mode
+
+                body, i = self.read_block(lines, i, "(", ")")
+                self.run_python(body, bindings)
+                continue
+
+            # IF
+            match = re.fullmatch(r"/if\s+(.+?)/\(", line)
+
+            if match:
+                body, i = self.read_block(lines, i, "(", ")")
+
+                if self.evaluate(match.group(1)):
+                    self.run_lines(body)
+
+                continue
+
+            if line == ")":
+                raise CpppError("Unexpected closing ')'")
+
+            # PUBLIC STATIC CLASS DECLARATION
+            match = re.fullmatch(
+                r"public\s+static\s+class\s+([A-Za-z_]\w*)\s*\{",
+                line,
+            )
+
+            if match:
+                name = match.group(1)
+                body, i = self.read_block(lines, i, "{", "}")
+                self.classes[name] = body
+                continue
+
+            # ENUM DECLARATION
+            match = re.fullmatch(
+                r"public\s+static\s+enum\s+([A-Za-z_]\w*)\s*\{",
+                line,
+            )
+
+            if match:
+                name = match.group(1)
+                body, i = self.read_block(lines, i, "{", "}")
+                self.parse_enum(name, body)
+                continue
+
+            # CLASS CALLS
+            match = re.fullmatch(r"/call\s+([A-Za-z_]\w*)/", line)
+
+            if match:
+                name = match.group(1)
+
+                if name not in self.classes:
+                    raise CpppError(f"Unknown class: {name}")
+
+                if self.call_depth >= 100:
+                    raise CpppError("Maximum class call depth exceeded")
+
+                self.call_depth += 1
+                try:
+                    self.run_lines(self.classes[name])
+                finally:
+                    self.call_depth -= 1
+
+                continue
+
+            # NESTED COMPILED LANGUAGES
+            match = re.fullmatch(
+                r"/(java|c|cplus|cpp)\s+\{(.+?)\}/\(",
+                line,
+            )
+
+            if match:
+                language, raw_bindings = match.groups()
+                bindings = {}
+
+                for item in raw_bindings.split(","):
+                    binding = re.fullmatch(
+                        r"\s*([A-Za-z_]\w*)\s+as\s+(val|null)\s*",
+                        item,
+                    )
+
+                    if not binding:
+                        raise CpppError(
+                            f"Invalid language binding: {item.strip()}"
+                        )
+
+                    name, mode = binding.groups()
+
+                    if name in bindings:
+                        raise CpppError(f"Duplicate binding: {name}")
+
+                    bindings[name] = mode
+
+                body, i = self.read_block(lines, i, "(", ")")
+
+                self.run_compiled_language(
+                    language,
+                    body,
+                    bindings,
+                )
+                continue
+
+            # SLASH COMMANDS
+            if not (line.startswith("/") and line.endswith("/")):
+                if line.startswith("run "):
+                    self.run_program(line[4:].strip())
+                    continue
+
+                raise CpppError(f"Invalid command: {line}")
+
+            command = line[1:-1].strip()
+
+            # --------------------------------------------------
+            # NATIVE SYSTEM MEMORY COMMANDS
+            # --------------------------------------------------
+
+            # /system_memory alloc [num address] 64/
+            match = re.fullmatch(
+                r"system_memory\s+alloc\s+"
+                r"\[num\s+([A-Za-z_]\w*)\]\s+(\d+)",
+                command,
+            )
+
+            if match:
+                name, size = match.groups()
+
+                address = self.system_memory_alloc(int(size))
+                self.set_variable(name, address, "num")
+                continue
+
+            # /system_memory write {address} 123 0/
+            match = re.fullmatch(
+                r"system_memory\s+write\s+"
+                r"(\{[A-Za-z_]\w*\})\s+(\d+)\s+(\d+)",
+                command,
+            )
+
+            if match:
+                address_expr, value, offset = match.groups()
+
+                self.system_memory_write(
+                    self.get_value(address_expr),
+                    int(value),
+                    int(offset),
+                )
+                continue
+
+            # /system_memory read [num result] {address} 0/
+            match = re.fullmatch(
+                r"system_memory\s+read\s+"
+                r"\[num\s+([A-Za-z_]\w*)\]\s+"
+                r"(\{[A-Za-z_]\w*\})\s+(\d+)",
+                command,
+            )
+
+            if match:
+                name, address_expr, offset = match.groups()
+
+                value = self.system_memory_read(
+                    self.get_value(address_expr),
+                    int(offset),
+                )
+
+                self.set_variable(name, value, "num")
+                continue
+
+            # /system_memory free {address}/
+            match = re.fullmatch(
+                r"system_memory\s+free\s+"
+                r"(\{[A-Za-z_]\w*\})",
+                command,
+            )
+
+            if match:
+                address = self.get_value(match.group(1))
+                self.system_memory_free(address)
+                continue
+
+            # MEMORY WRITE STRING
+            match = re.fullmatch(
+                r'memory\s+write_string\s+(\{[A-Za-z_]\w*\})\s+("(?:\\.|[^"\\])*")\s+(\d+)',
+                command,
+            )
+
+            if match:
+                address_expr, value_expr, offset = match.groups()
+                self.memory_write_string(
+                    self.get_value(address_expr),
+                    self.get_value(value_expr),
+                    int(offset),
+                )
+                continue
+
+            # MEMORY READ STRING
+            match = re.fullmatch(
+                r'memory\s+read_string\s+\[val\s+([A-Za-z_]\w*)\]\s+(\{[A-Za-z_]\w*\})\s+(\d+)\s+(\d+)',
+                command,
+            )
+
+            if match:
+                name, address_expr, length, offset = match.groups()
+
+                value = self.memory_read_string(
+                    self.get_value(address_expr),
+                    int(length),
+                    int(offset),
+                )
+
+                self.set_variable(name, value, "val")
+                continue
+
+            # MEMORY WRITE INT32
+            match = re.fullmatch(
+                r'memory\s+write_int32\s+(\{[A-Za-z_]\w*\})\s+(-?\d+)\s+(\d+)',
+                command,
+            )
+
+            if match:
+                address_expr, value, offset = match.groups()
+
+                self.memory_write_int32(
+                    self.get_value(address_expr),
+                    int(value),
+                    int(offset),
+                )
+                continue
+
+            # MEMORY READ INT32
+            match = re.fullmatch(
+                r'memory\s+read_int32\s+\[num\s+([A-Za-z_]\w*)\]\s+(\{[A-Za-z_]\w*\})\s+(\d+)',
+                command,
+            )
+
+            if match:
+                name, address_expr, offset = match.groups()
+
+                value = self.memory_read_int32(
+                    self.get_value(address_expr),
+                    int(offset),
+                )
+
+                self.set_variable(name, value, "num")
+                continue
+
+            # MEMORY DUMP
+            match = re.fullmatch(
+                r'memory\s+dump\s+(\{[A-Za-z_]\w*\})\s+(\d+)\s+(\d+)',
+                command,
+            )
+
+            if match:
+                address_expr, offset, length = match.groups()
+
+                self.memory_dump(
+                    self.get_value(address_expr),
+                    int(offset),
+                    int(length),
+                )
+                continue
+
+            # MEMORY SYSTEM
+
+            # /memory alloc [num address] 64/
+            match = re.fullmatch(
+                r"memory\s+alloc\s+\[num\s+([A-Za-z_]\w*)\]\s+(\d+)",
+                command,
+            )
+
+            if match:
+                name, size = match.groups()
+
+                address = self.memory_alloc(int(size))
+                self.set_variable(name, address, "num")
+                continue
+
+            # /memory write {address} 123/
+            match = re.fullmatch(
+                r"memory\s+write\s+(.+?)\s+(\d+)",
+                command,
+            )
+
+            if match:
+                address_expr, value = match.groups()
+
+                address = self.get_value(address_expr)
+
+                self.memory_write(address, int(value))
+                continue
+
+            # /memory read [num result] {address}/
+            match = re.fullmatch(
+                r"memory\s+read\s+\[num\s+([A-Za-z_]\w*)\]\s+(.+)",
+                command,
+            )
+
+            if match:
+                name, address_expr = match.groups()
+
+                address = self.get_value(address_expr)
+                value = self.memory_read(address)
+
+                self.set_variable(name, value, "num")
+                continue
+
+            # /memory free {address}/
+            match = re.fullmatch(
+                r"memory\s+free\s+(.+)",
+                command,
+            )
+
+            if match:
+                address = self.get_value(match.group(1))
+                self.memory_free(address)
+                continue
+
+            # /val f is val "SHISH"/
+            # /val n is num 67/
+            # /val d is null/
+            match = re.fullmatch(
+                r"val\s+([A-Za-z_]\w*)\s+is\s+"
+                r"(val|null|num)(?:\s+(.+))?",
+                command,
+            )
+
+            if match:
+                name, mode, expression = match.groups()
+
+                if mode == "null":
+                    value = None
+                elif expression is None:
+                    raise CpppError(
+                        f"Missing value for variable {name!r}"
+                    )
+                else:
+                    value = self.get_value(expression)
+
+                self.set_variable(name, value, mode)
+                continue
+
+            # /print [val f]/
+            # /print [null d]/
+            # /print "Hello"/
+            match = re.fullmatch(r"print\s+(.+)", command)
+
+            if match:
+                value = self.get_value(match.group(1))
+                print("null" if value is None else value)
+                continue
+
+            # /random [val a] [enum alph] 16/
+            match = re.fullmatch(
+                r"random\s+\[val\s+([A-Za-z_]\w*)\]"
+                r"\s+\[enum\s+([A-Za-z_]\w*)\]\s+(\d+)",
+                command,
+            )
+
+            if match:
+                name, enum_name, length = match.groups()
+                self.random_value(name, enum_name, int(length))
+                continue
+
+            # /run "cmd.exe"/
+            match = re.fullmatch(r"run\s+(.+)", command)
+
+            if match:
+                self.run_program(match.group(1))
+                continue
+
+            raise CpppError(f"Unknown command: /{command}/")
+
+    def execute(self, source, source_path=None):
+        self.source_path = (
+            Path(source_path).resolve()
+            if source_path is not None
+            else Path.cwd() / "main.cppp"
+        )
+
+        lines = self.remove_comments(source)
+        self.run_lines(lines)
+
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+
+    dangerous_flag = "--i-know-what-im-doin"
+    system_memory_enabled = dangerous_flag in args
+
+    args = [
+        arg for arg in args
+        if arg != dangerous_flag
+    ]
+
+    if len(args) != 1:
+        print(
+            "Usage: python main.py <file.cppp> "
+            "[--i-know-what-im-doin]"
+        )
+        sys.exit(1)
+
+    source_path = Path(args[0]).resolve()
+
+    interpreter = None
+
+    try:
+        source = source_path.read_text(encoding="utf-8")
+
+        interpreter = Cppp(
+            system_memory_enabled=system_memory_enabled
+        )
+
+        interpreter.execute(source, source_path)
+
+    except (CpppError, OSError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)
+
+    finally:
+        if interpreter is not None:
+            interpreter.close_system_memory()

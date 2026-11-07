@@ -1,0 +1,47 @@
+
+/val py_output is val ""/
+/val c_output is val ""/
+/val cp_output is val ""/
+/val cpp_output is val ""/
+/val java_output is val ""/
+
+/c {c_output as val}/(
+    #include <stdio.h>
+
+    int main() {
+        printf("Hello from C!");
+        return 0;
+    }
+)
+
+/cplus {cp_output as val}/(
+    #include <iostream>
+
+    int main() {
+        std::cout << "Hello from C+!";
+        return 0;
+    }
+)
+
+/cpp {cpp_output as val}/(
+    #include <iostream>
+
+    int main() {
+        std::cout << "Hello from C++!";
+        return 0;
+    }
+)
+
+/java {java_output as val}/(
+    public class Main {
+        public static void main(String[] args) {
+            System.out.print("Hello from Java!");
+        }
+    }
+)
+
+/print "=== LANGUAGE TEST ==="/
+/print {c_output}/
+/print {cp_output}/
+/print {cpp_output}/
+/print {java_output}/

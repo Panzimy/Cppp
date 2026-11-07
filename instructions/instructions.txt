@@ -1,0 +1,9 @@
+Important folders:
+java: Stores the java compiler (prepacked with Java 25)
+mingw64: Stores C compilers
+tests: testing folder
+native: .dll and .cpp for direct process memory access
+Requirements: Python 3.15
+Usages: Just run main.py
+Linux users:
+I don't offer linux support (for now)

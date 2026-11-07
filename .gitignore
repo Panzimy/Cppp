@@ -1,0 +1,7 @@
+/win/java/
+/win/mingw64/
+/linux/java/
+/linux/mingw64/
+/.idea/
+/venv/
+/.venv/

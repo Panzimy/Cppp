@@ -1,0 +1,14 @@
+/val f is val "SHISH"/
+/val g is val "AAAA"/
+/val h is null/
+
+/python {f as val, d as null}/(
+    print("This is some Python Code")
+    f = input("Zadej text: ")
+    d = 123
+    g = "a"
+)
+
+/print {g}/
+/print {f}/
+/print {d}/

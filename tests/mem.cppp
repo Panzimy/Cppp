@@ -1,0 +1,45 @@
+/print "Memory edits ahead"/
+
+
+/val address is num 0/
+/val result is num 0/
+/val text is val ""/
+
+/memory alloc [num address] 64/
+
+/print "=== STRING TEST ==="/
+
+/memory write_string {address} "HELLO" 0/
+/memory read_string [val text] {address} 5 0/
+
+/print {text}/
+
+/print "=== INT32 TEST ==="/
+
+/memory write_int32 {address} 123456 8/
+/memory read_int32 [num result] {address} 8/
+
+/print {result}/
+
+/print "=== MEMORY DUMP ==="/
+
+/memory dump {address} 0 16/
+
+/memory free {address}/
+
+/print "=== C+++ SYSTEM MEMORY ==="/
+
+/val address is num 0/
+/val result is num 0/
+
+/system_memory alloc [num address] 64/
+
+/system_memory write {address} 123 0/
+
+/system_memory read [num result] {address} 0/
+
+/print {result}/
+
+/system_memory free {address}/
+
+/print "Memory released"/

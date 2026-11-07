@@ -1,0 +1,21 @@
+# Standart enums for C+++
+
+public static enum alph {
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+}
+
+public static enum num {
+    "0123456789"
+}
+
+public static enum alphanumeric {
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+}
+
+public static enum lower {
+    "abcdefghijklmnopqrstuvwxyz"
+}
+
+public static enum upper {
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+}
